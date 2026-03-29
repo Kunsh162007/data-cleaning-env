@@ -1,0 +1,164 @@
+name: data-cleaning-env
+version: "1.0.0"
+description: >
+  A reinforcement-learning environment where an AI agent learns to clean and
+  validate messy real-world datasets. The agent receives a dirty dataset and
+  must apply targeted cleaning operations (de-duplication, type coercion,
+  normalisation, outlier removal, format standardisation) to maximise a
+  data-quality score.
+
+author: openenv-submission
+tags:
+  - openenv
+  - data-cleaning
+  - data-validation
+  - real-world
+  - tabular
+
+environment:
+  type: sequential
+  action_space: discrete-parametric
+  observation_space: structured
+
+tasks:
+  - id: task_easy
+    name: "Customer Records Cleanup"
+    difficulty: easy
+    max_steps: 10
+    description: >
+      Fix a small customer records dataset: convert age values from strings to
+      integers, fill/drop rows with N/A ages, remove duplicate rows, and strip
+      whitespace from name fields.
+    grader_checks:
+      - name: no_null_ages
+        weight: 0.30
+        description: No null or N/A values in the age column
+      - name: no_duplicates
+        weight: 0.25
+        description: No duplicate rows in the dataset
+      - name: age_is_numeric
+        weight: 0.25
+        description: All age values are integer or float type
+      - name: no_name_whitespace
+        weight: 0.20
+        description: No leading/trailing whitespace in name fields
+
+  - id: task_medium
+    name: "Product Inventory Normalisation"
+    difficulty: medium
+    max_steps: 15
+    description: >
+      Normalise a product inventory dataset: standardise inconsistent category
+      casing, remove negative prices, fill null stock values with 0, and fill
+      null product codes.
+    grader_checks:
+      - name: consistent_categories
+        weight: 0.25
+        description: All category values use consistent title-case
+      - name: no_negative_prices
+        weight: 0.25
+        description: No negative values in the price column
+      - name: no_null_stocks
+        weight: 0.25
+        description: No null values in the stock column (filled with 0)
+      - name: no_null_product_codes
+        weight: 0.25
+        description: No null product code values
+
+  - id: task_hard
+    name: "Orders Validation"
+    difficulty: hard
+    max_steps: 20
+    description: >
+      Validate and repair a multi-issue orders dataset: standardise date formats
+      to ISO 8601, remove negative quantities, fix invalid emails, strip currency
+      symbols from prices, and clamp discount percentages to [0, 100].
+    grader_checks:
+      - name: iso_dates
+        weight: 0.20
+        description: All dates are in YYYY-MM-DD format
+      - name: no_negative_quantities
+        weight: 0.20
+        description: No negative quantity values
+      - name: valid_emails
+        weight: 0.20
+        description: All customer emails match name@domain.tld format
+      - name: numeric_prices
+        weight: 0.20
+        description: All price values are numeric floats (no currency symbols)
+      - name: valid_discounts
+        weight: 0.20
+        description: All discount_pct values are in [0, 100]
+
+action_space:
+  type: object
+  description: >
+    Named cleaning operation with optional parameters.
+    The agent selects one operation per step.
+  properties:
+    action_type:
+      type: string
+      enum:
+        - drop_nulls
+        - fill_nulls
+        - fix_type
+        - normalize_column
+        - remove_duplicates
+        - clip_outliers
+        - strip_whitespace
+        - filter_rows
+        - standardize_dates
+        - strip_currency
+        - drop_invalid
+        - done
+    params:
+      type: object
+      description: Operation-specific parameters (see README for full spec)
+
+observation_space:
+  type: object
+  properties:
+    task_id:
+      type: string
+    task_description:
+      type: string
+    dataset:
+      type: array
+      items:
+        type: object
+      description: Current rows of the dataset
+    column_info:
+      type: object
+      description: Per-column statistics (dtype, null_count, unique_count, sample_values)
+    issues_detected:
+      type: array
+      items:
+        type: string
+      description: Automatically-detected data quality problems
+    step:
+      type: integer
+    max_steps:
+      type: integer
+    score:
+      type: number
+      minimum: 0.0
+      maximum: 1.0
+
+reward:
+  type: delta
+  description: >
+    Step reward = (new_score - old_score) - 0.01 step penalty.
+    Invalid actions return -0.05.
+    Calling "done" returns final_score ± bonus/penalty.
+  range: [-0.10, 1.10]
+
+docker:
+  port: 7860
+  health_endpoint: /health
+
+baseline:
+  script: inference.py
+  tasks:
+    - task_easy
+    - task_medium
+    - task_hard
