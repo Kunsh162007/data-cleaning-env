@@ -51,11 +51,11 @@ SYSTEM_PROMPT = textwrap.dedent("""
 You are an expert data cleaning agent. You receive information about a messy dataset
 and must apply cleaning operations one at a time to fix all detected issues.
 
-Available actions (respond with ONLY a valid JSON object — no markdown, no prose):
+Available actions (respond with ONLY a valid JSON object - no markdown, no prose):
 
 {"action_type": "remove_duplicates",  "params": {}}
 {"action_type": "drop_nulls",         "params": {"column": "<col>"}}
-{"action_type": "fill_nulls",         "params": {"column": "<col>", "value": <val>}}
+{"action_type": "fill_nulls",         "params": {"column": "<col>", "value": 0}}
 {"action_type": "fill_nulls",         "params": {"column": "<col>", "strategy": "zero"}}
 {"action_type": "fix_type",           "params": {"column": "<col>", "dtype": "int"}}
 {"action_type": "fix_type",           "params": {"column": "<col>", "dtype": "float"}}
@@ -138,9 +138,7 @@ def parse_action(response_text: str) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def run_task(client: OpenAI, task_id: str) -> float:
-    print(f"\n{'='*60}")
-    print(f"  TASK: {task_id.upper()}")
-    print(f"{'='*60}")
+    print(f"START {task_id}")
 
     try:
         env = DataCleaningEnv()
@@ -148,17 +146,10 @@ def run_task(client: OpenAI, task_id: str) -> float:
         obs = result.observation
         history: List[str] = []
 
-        print(f"  Description: {obs.task_description}")
-        print(f"  Issues at start ({len(obs.issues_detected)}):")
-        for issue in obs.issues_detected:
-            print(f"    * {issue}")
-        print(f"  Initial score: {obs.score:.4f}\n")
-
         final_score = obs.score
 
         for step in range(1, MAX_STEPS_PER_TASK + 1):
             if result.done:
-                print(f"  Episode done at step {step - 1}.")
                 break
 
             try:
@@ -186,7 +177,7 @@ def run_task(client: OpenAI, task_id: str) -> float:
                 print(f"  [warn] Action parse failed: {exc}. Using fallback.")
                 action = Action(**FALLBACK_ACTION)
 
-            print(f"  Step {step:>2}: {action.action_type}({json.dumps(action.params)})")
+            print(f"STEP {step} action={action.action_type} params={json.dumps(action.params)}")
 
             try:
                 result = env.step(action)
@@ -201,26 +192,25 @@ def run_task(client: OpenAI, task_id: str) -> float:
                 f"Step {step}: {action.action_type}({json.dumps(action.params)}) "
                 f"-> reward={reward.value:+.4f}, score={obs.score:.4f}"
             )
-            print(f"           reward={reward.value:+.4f}  score={obs.score:.4f}  done={result.done}")
 
             if result.done:
                 break
         else:
-            print(f"  Reached max steps ({MAX_STEPS_PER_TASK}).")
+            print(f"  [warn] Reached max steps ({MAX_STEPS_PER_TASK}).")
 
         try:
             _, breakdown = grade_task(task_id, env.dataset)
-            print(f"\n  Final score: {final_score:.4f}")
-            print("  Score breakdown:")
             for check, val in breakdown.items():
-                print(f"    {check:<30} {val:.4f}")
+                print(f"  score {check}={val:.4f}")
         except Exception as exc:
             print(f"  [warn] Could not compute breakdown: {exc}")
 
+        print(f"END {task_id} score={final_score:.4f}")
         return final_score
 
     except Exception as exc:
         print(f"  [error] Task {task_id} failed: {exc}")
+        print(f"END {task_id} score=0.0000")
         return 0.0
 
 
@@ -244,11 +234,12 @@ def main() -> None:
         print(f"[ERROR] Failed to create OpenAI client: {exc}")
         sys.exit(1)
 
-    print("\n" + "="*60)
-    print("  Data Cleaning Environment — Baseline Inference")
-    print("="*60)
-    print(f"  Model:    {MODEL_NAME}")
-    print(f"  Base URL: {API_BASE_URL}")
+    print("=" * 60)
+    print("Data Cleaning Environment - Baseline Inference")
+    print("=" * 60)
+    print(f"Model:    {MODEL_NAME}")
+    print(f"Base URL: {API_BASE_URL}")
+    print()
 
     scores: Dict[str, float] = {}
     for task_id in TASKS:
@@ -256,17 +247,19 @@ def main() -> None:
             scores[task_id] = run_task(client, task_id)
         except Exception as exc:
             print(f"[error] Unhandled exception in {task_id}: {exc}")
+            print(f"END {task_id} score=0.0000")
             scores[task_id] = 0.0
 
-    print("\n" + "="*60)
-    print("  FINAL SCORES SUMMARY")
-    print("="*60)
+    print()
+    print("=" * 60)
+    print("FINAL SCORES SUMMARY")
+    print("=" * 60)
     for task_id, score in scores.items():
-        bar = "█" * int(score * 20)
-        print(f"  {task_id:<14}  {score:.4f}  {bar}")
+        bar = "X" * int(score * 20)
+        print(f"{task_id:<14}  {score:.4f}  {bar}")
     avg = sum(scores.values()) / len(scores)
-    print(f"\n  Average score: {avg:.4f}")
-    print("="*60)
+    print(f"Average score: {avg:.4f}")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
