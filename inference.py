@@ -11,9 +11,6 @@ HF_TOKEN      : Hugging Face / API key
 Usage
 -----
     python inference.py
-
-The script runs a single episode for each of the three tasks, prints step-by-step
-progress, and reports final grader scores.  Total wall-time is well under 20 min.
 """
 
 import json
@@ -21,14 +18,15 @@ import os
 import re
 import sys
 import textwrap
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
+
+# Ensure repo root is on the path so `env` package is importable
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from openai import OpenAI
 
-# ---------------------------------------------------------------------------
-# Environment import (direct — no HTTP overhead)
-# ---------------------------------------------------------------------------
 from env import Action, DataCleaningEnv
+from env.graders import grade_task
 
 # ---------------------------------------------------------------------------
 # Config
@@ -37,13 +35,12 @@ API_BASE_URL: str = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1"
 API_KEY: str      = os.getenv("HF_TOKEN") or os.getenv("API_KEY", "")
 MODEL_NAME: str   = os.getenv("MODEL_NAME", "")
 
-MAX_STEPS_PER_TASK = 12   # Hard cap per episode (env may end earlier)
+MAX_STEPS_PER_TASK = 12
 TEMPERATURE        = 0.1
 MAX_TOKENS         = 256
-HISTORY_WINDOW     = 5    # Last N actions shown to model
+HISTORY_WINDOW     = 5
 
 FALLBACK_ACTION = {"action_type": "done", "params": {}}
-
 TASKS = ["task_easy", "task_medium", "task_hard"]
 
 # ---------------------------------------------------------------------------
@@ -62,15 +59,14 @@ Available actions (respond with ONLY a valid JSON object — no markdown, no pro
 {"action_type": "fill_nulls",         "params": {"column": "<col>", "strategy": "zero"}}
 {"action_type": "fix_type",           "params": {"column": "<col>", "dtype": "int"}}
 {"action_type": "fix_type",           "params": {"column": "<col>", "dtype": "float"}}
-{"action_type": "normalize_column",   "params": {"column": "<col>", "mapping": {"old": "new"}}}
-{"action_type": "normalize_column",   "params": {"column": "<col>"}}   ← auto title-case
+{"action_type": "normalize_column",   "params": {"column": "<col>"}}
 {"action_type": "clip_outliers",      "params": {"column": "<col>", "lower": 0, "upper": 9999}}
 {"action_type": "strip_whitespace",   "params": {"column": "<col>"}}
 {"action_type": "standardize_dates",  "params": {"column": "<col>"}}
 {"action_type": "strip_currency",     "params": {"column": "<col>"}}
+{"action_type": "drop_invalid",       "params": {"column": "<col>", "rule": "email"}}
 {"action_type": "filter_rows",        "params": {"column": "<col>", "operator": ">=", "value": 0}}
-{"action_type": "drop_invalid",       "params": {"column": "<col>", "rule": "email"}}   ← rules: email | positive | iso_date
-{"action_type": "done",               "params": {}}   ← call when dataset is clean
+{"action_type": "done",               "params": {}}
 
 Rules:
 - Output ONLY the JSON object, nothing else.
@@ -79,22 +75,12 @@ Rules:
 """).strip()
 
 
-def build_user_prompt(
-    step: int,
-    obs: Any,
-    history: List[str],
-) -> str:
-    # Show a compact dataset sample (first 4 rows max)
+def build_user_prompt(step: int, obs: Any, history: List[str]) -> str:
     sample = obs.dataset[:4]
     sample_str = json.dumps(sample, indent=2)
-
     col_info_str = json.dumps(obs.column_info, indent=2)
-
-    issues_str = "\n".join(f"  • {i}" for i in obs.issues_detected)
-
-    history_str = (
-        "\n".join(history[-HISTORY_WINDOW:]) if history else "  (none yet)"
-    )
+    issues_str = "\n".join(f"  - {i}" for i in obs.issues_detected)
+    history_str = "\n".join(history[-HISTORY_WINDOW:]) if history else "  (none yet)"
 
     return textwrap.dedent(f"""
         TASK:   {obs.task_description}
@@ -125,32 +111,24 @@ _JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
 
 
 def parse_action(response_text: str) -> Dict[str, Any]:
-    """Extract the first JSON object from the model response."""
     if not response_text:
         return FALLBACK_ACTION
-
-    # Try direct parse first
     text = response_text.strip()
-    # Strip markdown fences if present
     text = re.sub(r"```(?:json)?\s*", "", text).strip().rstrip("`").strip()
-
     try:
         obj = json.loads(text)
         if "action_type" in obj:
             return obj
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, ValueError):
         pass
-
-    # Regex extraction fallback
     match = _JSON_OBJECT_RE.search(response_text)
     if match:
         try:
             obj = json.loads(match.group(0))
             if "action_type" in obj:
                 return obj
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, ValueError):
             pass
-
     print(f"  [warn] Could not parse action from: {response_text!r}")
     return FALLBACK_ACTION
 
@@ -164,80 +142,86 @@ def run_task(client: OpenAI, task_id: str) -> float:
     print(f"  TASK: {task_id.upper()}")
     print(f"{'='*60}")
 
-    env = DataCleaningEnv()
-    result = env.reset(task_id)
-    obs = result.observation
-    history: List[str] = []
+    try:
+        env = DataCleaningEnv()
+        result = env.reset(task_id)
+        obs = result.observation
+        history: List[str] = []
 
-    print(f"  Description: {obs.task_description}")
-    print(f"  Issues at start ({len(obs.issues_detected)}):")
-    for issue in obs.issues_detected:
-        print(f"    • {issue}")
-    print(f"  Initial score: {obs.score:.4f}")
-    print()
-
-    final_score = obs.score
-
-    for step in range(1, MAX_STEPS_PER_TASK + 1):
-        if result.done:
-            print(f"  Episode done at step {step - 1}.")
-            break
-
-        # Build messages
-        user_prompt = build_user_prompt(step, obs, history)
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": user_prompt},
-        ]
-
-        # LLM call
-        try:
-            completion = client.chat.completions.create(
-                model=MODEL_NAME,
-                messages=messages,
-                temperature=TEMPERATURE,
-                max_tokens=MAX_TOKENS,
-                stream=False,
-            )
-            response_text = completion.choices[0].message.content or ""
-        except Exception as exc:  # noqa: BLE001
-            print(f"  [error] LLM call failed: {exc}. Using fallback.")
-            response_text = json.dumps(FALLBACK_ACTION)
-
-        action_dict = parse_action(response_text)
-        action = Action(**action_dict)
-
-        print(f"  Step {step:>2}: {action.action_type}({json.dumps(action.params)})")
-
-        result = env.step(action)
-        obs    = result.observation
-        reward = result.reward
+        print(f"  Description: {obs.task_description}")
+        print(f"  Issues at start ({len(obs.issues_detected)}):")
+        for issue in obs.issues_detected:
+            print(f"    * {issue}")
+        print(f"  Initial score: {obs.score:.4f}\n")
 
         final_score = obs.score
-        history.append(
-            f"Step {step}: {action.action_type}({json.dumps(action.params)}) "
-            f"→ reward={reward.value:+.4f}, score={obs.score:.4f}"
-        )
 
-        print(f"           reward={reward.value:+.4f}  score={obs.score:.4f}  done={result.done}")
-        if reward.message:
-            print(f"           msg: {reward.message}")
+        for step in range(1, MAX_STEPS_PER_TASK + 1):
+            if result.done:
+                print(f"  Episode done at step {step - 1}.")
+                break
 
-        if result.done:
-            break
-    else:
-        print(f"  Reached max inference steps ({MAX_STEPS_PER_TASK}).")
+            try:
+                user_prompt = build_user_prompt(step, obs, history)
+                messages = [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user",   "content": user_prompt},
+                ]
+                completion = client.chat.completions.create(
+                    model=MODEL_NAME,
+                    messages=messages,
+                    temperature=TEMPERATURE,
+                    max_tokens=MAX_TOKENS,
+                    stream=False,
+                )
+                response_text = completion.choices[0].message.content or ""
+            except Exception as exc:
+                print(f"  [warn] LLM call failed: {exc}. Using fallback.")
+                response_text = json.dumps(FALLBACK_ACTION)
 
-    # Print final breakdown
-    _, breakdown = __import__("env.graders", fromlist=["grade_task"]).grade_task(
-        task_id, env.dataset
-    )
-    print(f"\n  Final score: {final_score:.4f}")
-    print("  Score breakdown:")
-    for check, val in breakdown.items():
-        print(f"    {check:<30} {val:.4f}")
+            try:
+                action_dict = parse_action(response_text)
+                action = Action(**action_dict)
+            except Exception as exc:
+                print(f"  [warn] Action parse failed: {exc}. Using fallback.")
+                action = Action(**FALLBACK_ACTION)
 
-    return final_score
+            print(f"  Step {step:>2}: {action.action_type}({json.dumps(action.params)})")
+
+            try:
+                result = env.step(action)
+                obs    = result.observation
+                reward = result.reward
+                final_score = obs.score
+            except Exception as exc:
+                print(f"  [warn] env.step failed: {exc}")
+                break
+
+            history.append(
+                f"Step {step}: {action.action_type}({json.dumps(action.params)}) "
+                f"-> reward={reward.value:+.4f}, score={obs.score:.4f}"
+            )
+            print(f"           reward={reward.value:+.4f}  score={obs.score:.4f}  done={result.done}")
+
+            if result.done:
+                break
+        else:
+            print(f"  Reached max steps ({MAX_STEPS_PER_TASK}).")
+
+        try:
+            _, breakdown = grade_task(task_id, env.dataset)
+            print(f"\n  Final score: {final_score:.4f}")
+            print("  Score breakdown:")
+            for check, val in breakdown.items():
+                print(f"    {check:<30} {val:.4f}")
+        except Exception as exc:
+            print(f"  [warn] Could not compute breakdown: {exc}")
+
+        return final_score
+
+    except Exception as exc:
+        print(f"  [error] Task {task_id} failed: {exc}")
+        return 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -245,7 +229,6 @@ def run_task(client: OpenAI, task_id: str) -> float:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    # Validate config
     missing = []
     if not API_KEY:
         missing.append("HF_TOKEN (or API_KEY)")
@@ -253,13 +236,13 @@ def main() -> None:
         missing.append("MODEL_NAME")
     if missing:
         print(f"[ERROR] Missing required environment variables: {', '.join(missing)}")
-        print("  Set them before running:")
-        print("    export HF_TOKEN=hf_...")
-        print("    export MODEL_NAME=Qwen/Qwen2.5-72B-Instruct")
-        print("    export API_BASE_URL=https://router.huggingface.co/v1  # optional")
         sys.exit(1)
 
-    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+    try:
+        client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+    except Exception as exc:
+        print(f"[ERROR] Failed to create OpenAI client: {exc}")
+        sys.exit(1)
 
     print("\n" + "="*60)
     print("  Data Cleaning Environment — Baseline Inference")
@@ -269,9 +252,12 @@ def main() -> None:
 
     scores: Dict[str, float] = {}
     for task_id in TASKS:
-        scores[task_id] = run_task(client, task_id)
+        try:
+            scores[task_id] = run_task(client, task_id)
+        except Exception as exc:
+            print(f"[error] Unhandled exception in {task_id}: {exc}")
+            scores[task_id] = 0.0
 
-    # Summary
     print("\n" + "="*60)
     print("  FINAL SCORES SUMMARY")
     print("="*60)
