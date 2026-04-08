@@ -55,6 +55,10 @@ Rules:
 """).strip()
 
 
+def log(msg):
+    print(msg, flush=True)
+
+
 def build_user_prompt(step, obs, history):
     try:
         sample_str   = json.dumps(obs.dataset[:4], indent=2)
@@ -100,8 +104,10 @@ def parse_action(text):
 
 
 def run_task(client, task_id):
-    print(f"START {task_id}")
+    log(f"[START] task={task_id}")
     final_score = 0.0
+    total_steps = 0
+
     try:
         from env import Action, DataCleaningEnv
         from env.graders import grade_task
@@ -130,42 +136,36 @@ def run_task(client, task_id):
                 )
                 response_text = completion.choices[0].message.content or ""
             except Exception as e:
-                print(f"  [warn] LLM error: {e}")
+                log(f"  [warn] LLM error: {e}")
 
             try:
                 action = Action(**parse_action(response_text))
             except Exception:
                 action = Action(**FALLBACK_ACTION)
 
-            print(f"STEP {step} action={action.action_type} params={json.dumps(action.params)}")
-
             try:
                 result      = env.step(action)
                 obs         = result.observation
                 reward      = result.reward
                 final_score = obs.score
+                total_steps = step
                 history.append(
                     f"Step {step}: {action.action_type} "
                     f"reward={reward.value:+.4f} score={obs.score:.4f}"
                 )
+                log(f"[STEP] step={step} action={action.action_type} reward={reward.value:.4f} score={obs.score:.4f}")
             except Exception as e:
-                print(f"  [warn] step error: {e}")
+                log(f"  [warn] step error: {e}")
+                log(f"[STEP] step={step} action={action.action_type} reward=0.0000 score={final_score:.4f}")
                 break
 
             if result.done:
                 break
 
-        try:
-            _, breakdown = grade_task(task_id, env.dataset)
-            for check, val in breakdown.items():
-                print(f"  score {check}={val:.4f}")
-        except Exception:
-            pass
-
     except Exception as e:
-        print(f"  [error] task failed: {e}")
+        log(f"  [error] task failed: {e}")
 
-    print(f"END {task_id} score={final_score:.4f}")
+    log(f"[END] task={task_id} score={final_score:.4f} steps={total_steps}")
     return final_score
 
 
@@ -174,41 +174,36 @@ def main():
         from openai import OpenAI
         client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
     except Exception as e:
-        print(f"[ERROR] Could not create client: {e}")
+        log(f"[ERROR] Could not create client: {e}")
         for task_id in TASKS:
-            print(f"START {task_id}")
-            print(f"END {task_id} score=0.0000")
+            log(f"[START] task={task_id}")
+            log(f"[END] task={task_id} score=0.0000 steps=0")
         return
 
-    print("=" * 60)
-    print("Data Cleaning Environment - Baseline Inference")
-    print("=" * 60)
-    print(f"Model:    {MODEL_NAME}")
-    print(f"Base URL: {API_BASE_URL}")
-    print()
+    log("Data Cleaning Environment - Baseline Inference")
+    log(f"Model: {MODEL_NAME}")
+    log(f"Base URL: {API_BASE_URL}")
 
     scores = {}
     for task_id in TASKS:
         try:
             scores[task_id] = run_task(client, task_id)
         except Exception as e:
-            print(f"[error] {task_id}: {e}")
-            print(f"END {task_id} score=0.0000")
+            log(f"[error] {task_id}: {e}")
+            log(f"[START] task={task_id}")
+            log(f"[END] task={task_id} score=0.0000 steps=0")
             scores[task_id] = 0.0
 
-    print()
-    print("=" * 60)
-    print("FINAL SCORES")
-    print("=" * 60)
+    log("FINAL SCORES")
     for task_id, score in scores.items():
-        print(f"{task_id}: {score:.4f}")
+        log(f"{task_id}: {score:.4f}")
     avg = sum(scores.values()) / len(scores)
-    print(f"Average: {avg:.4f}")
+    log(f"Average: {avg:.4f}")
 
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        print(f"[FATAL] {e}")
+        log(f"[FATAL] {e}")
     sys.exit(0)
