@@ -180,4 +180,10 @@ def grade_task(task_id: str, dataset: List[Dict[str, Any]]) -> Tuple[float, Dict
     grader = graders.get(task_id)
     if grader is None:
         raise ValueError(f"Unknown task_id '{task_id}'")
-    return grader(dataset)
+    score, breakdown = grader(dataset)
+    return _clamp(score), breakdown
+
+
+def _clamp(score: float) -> float:
+    """Clamp score to strictly open interval (0.001, 0.999)."""
+    return round(max(0.001, min(0.999, score)), 4)
